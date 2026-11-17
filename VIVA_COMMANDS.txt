@@ -1,0 +1,167 @@
+=====================================================================
+ CS6350 TPA-1  |  Tag-Guided Foundation-Model Pseudo-Labels for DAOD
+ Viva commands and notes (Windows PowerShell)
+=====================================================================
+
+All commands are run from the project folder:
+
+    cd D:\Projects\tagdaod_code
+
+Only the ResNet-50 student runs at the viva. It needs no internet and
+no GPU (about 0.5 s per image on the laptop CPU).
+
+
+---------------------------------------------------------------------
+ 0. BEFORE THE VIVA (30 min early)
+---------------------------------------------------------------------
+
+# Check that Python, PyTorch and the model files are in place
+python -c "import torch, torchvision, timm; print(torch.__version__, 'OK')"
+Test-Path runs\clipart\ours\last.pth
+Test-Path runs\foggy\ours\last.pth
+#   -> both must print True
+
+# Put the instructor's sample images into one folder, for example:
+mkdir D:\Projects\tagdaod_code\samples -Force
+#   (copy the given images into that folder)
+
+
+---------------------------------------------------------------------
+ 1. LIVE DEMO ON THE GIVEN SAMPLE IMAGES
+---------------------------------------------------------------------
+
+# Clipart / cartoon / art images (20 PASCAL VOC classes)
+python demo.py --ckpt runs/clipart/ours/last.pth --input samples --out viva_out --device cpu
+
+# Foggy / street-scene images (8 Cityscapes classes:
+# person, rider, car, truck, bus, train, motorcycle, bicycle)
+python demo.py --ckpt runs/foggy/ours/last.pth --input samples --out viva_out_foggy --device cpu
+
+# Open the results folder
+explorer viva_out
+explorer viva_out_foggy
+
+# If a sample shows few or no boxes: lower the score threshold
+# (default 0.5; lower = more boxes, but some may be wrong)
+python demo.py --ckpt runs/clipart/ours/last.pth --input samples --out viva_out_03 --device cpu --thresh 0.3
+
+# Run on a single image instead of a folder
+python demo.py --ckpt runs/clipart/ours/last.pth --input samples\IMAGE.jpg --out viva_out --device cpu
+
+# Notes
+#  - The terminal prints, per image: time, number of boxes, class and score.
+#  - Output images are saved as <name>_det.jpg in the --out folder.
+#  - If the samples are a different domain, run BOTH models.
+
+
+---------------------------------------------------------------------
+ 2. SIDE-BY-SIDE COMPARISON (if asked "how does it compare?")
+---------------------------------------------------------------------
+
+# Source-only vs DINOv2 without tags vs Ours, on the sample images
+python demo.py --ckpt runs/clipart/b0/last.pth runs/clipart/b2/last.pth runs/clipart/ours/last.pth --names "Source-only" "DINOv2, no tags" "Ours" --input samples --out viva_compare --device cpu
+
+# Foggy: Source-only vs Mean Teacher vs Ours
+python demo.py --ckpt runs/foggy/b0/last.pth runs/foggy/b1/last.pth runs/foggy/ours/last.pth --names "Source-only" "Mean Teacher" "Ours" --input samples --out viva_compare_foggy --device cpu
+
+# Add a ground-truth panel (only for images from the test sets)
+#   ... --gt data/json/clipart_test.json
+#   ... --gt data/json/foggy_val.json
+
+
+---------------------------------------------------------------------
+ 3. REPRODUCE THE REPORTED NUMBERS (if asked)
+---------------------------------------------------------------------
+
+# mAP@0.5 with per-class AP (prints all-point and VOC07 11-point)
+python evaluate.py --ckpt runs/clipart/ours/last.pth --data data/json/clipart_test.json
+python evaluate.py --ckpt runs/foggy/ours/last.pth --data data/json/foggy_val.json
+#   Takes about 1-2 min on the GPU, longer on CPU.
+
+# Pseudo-label precision / recall table (Clipart, all 4 refinement modes)
+Get-Content runs\clipart\refine_report.txt
+
+# Training curve of any run (mAP every 2000 iterations)
+Select-String "\[eval\]" runs\clipart\ours\log.txt
+
+
+---------------------------------------------------------------------
+ 4. FULL PIPELINE (what was run; for explanation only, do not rerun)
+---------------------------------------------------------------------
+
+# Step 0: data preparation (VOC / Clipart XML -> JSON; Cityscapes masks -> boxes)
+powershell -ExecutionPolicy Bypass -File scripts\run_clipart_priority.ps1 -Stage data
+powershell -ExecutionPolicy Bypass -File scripts\run_foggy_priority.ps1 -Stage data
+
+# Step 1: train the DINOv2 labeller on source boxes (frozen ViT-B/14, 20k iters)
+powershell -ExecutionPolicy Bypass -File scripts\run_clipart_priority.ps1 -Stage labeller
+
+# Step 1b + 2: pseudo-labels on target images, then tag refinement
+python generate_pseudo.py --ckpt runs/clipart/labeller/best.pth --data data/json/clipart_train_tags.json --out runs/clipart/pseudo_raw.json
+python refine_pseudo.py --raw runs/clipart/pseudo_raw.json --mode filter+recover --high 0.8 --low 0.3 --out runs/clipart/pseudo_filter_recover.json
+#   filter : drop boxes whose class is not in the image tags
+#   recover: tagged class with no box >= 0.8 -> keep its best box >= 0.3
+
+# Step 3: train the ResNet-50 student on source boxes + refined pseudo-labels (10k iters)
+python train.py --arch r50 --min-size 600 --max-size 1000 --batch 4 --lr 0.01 --amp --iters 10000 --source data/json/voc_trainval.json --target-labels pseudo --pseudo runs/clipart/pseudo_filter_recover.json --out runs/clipart/ours
+
+
+---------------------------------------------------------------------
+ 5. RESULTS (mAP@0.5, final checkpoint, evaluate.py)
+---------------------------------------------------------------------
+
+VOC -> Clipart1k (500 test images)            mAP@0.5   VOC07 11-pt
+  B0  Source-only ............................ 35.8      37.4
+  B1  Mean Teacher ........................... 50.8      51.3
+  B3  Mean Teacher + tag filter .............. 52.8      53.2
+  B2  DINOv2 pseudo-labels, no tags .......... 53.9      54.0
+  Ours  + tag filter and recover ............. 57.6      57.3
+  Oracle, naive (target boxes in source pool)  52.4      52.2
+  Oracle, matched (same pipeline, real boxes)  65.0      63.7
+  (DINOv2 labeller, reference, too heavy) .... 72.4      71.0
+
+Ablation (student mAP@0.5)      label precision / recall
+  threshold only ... 53.9        84.1 / 58.9
+  + filter ......... 53.5        87.8 / 58.9
+  + recover ........ 57.5        83.0 / 66.4
+  + both (Ours) .... 57.6        86.2 / 66.4
+
+Cityscapes -> Foggy Cityscapes (500 val images, beta 0.02)
+  B0  Source-only ............................ 40.3      41.6
+  B1  Mean Teacher ........................... 45.7      46.2
+  (DINOv2 labeller, reference) ............... 49.3      49.1
+  Ours ....................................... 50.5      51.0
+
+  All values: evaluate.py on the final checkpoint (last.pth).
+
+Key messages
+  - Ours: +21.8 mAP over source-only on Clipart; +10.2 on Foggy.
+  - Tags add +3.7 mAP over the same pipeline without tags (B2 -> Ours).
+  - The gain comes from RECOVER (missed objects); filter mainly raises label precision.
+  - Ours beats Mean Teacher with the same tags (B3) by +4.8; closes 75% of the
+    source-only -> oracle gap on Clipart.
+  - Foggy: +4.8 over Mean Teacher.
+  - On Foggy the student (50.5) beats its own frozen teacher (49.3).
+
+
+---------------------------------------------------------------------
+ 6. WHERE THINGS ARE
+---------------------------------------------------------------------
+
+runs\clipart\<run>\last.pth     final model of each run (ours, b0, b1, b2, b3, oracle_matched, ...)
+runs\clipart\<run>\log.txt      training log with [eval] lines
+runs\foggy\<run>\...            same for Foggy
+data\json\*.json                dataset files (paths are absolute to this laptop)
+fig_clipart\, fig\              report figures
+demo_test\                      CPU demo test outputs
+
+
+---------------------------------------------------------------------
+ 7. IF SOMETHING GOES WRONG
+---------------------------------------------------------------------
+
+"No module named torch"         -> wrong Python; run: py -3.11 demo.py ...
+"cannot find path" / no images  -> check the --input folder name; supported: .jpg .jpeg .png .bmp .webp
+No boxes on an image            -> try --thresh 0.3; objects may be outside the known classes
+Very slow                       -> close other programs; CPU takes ~0.5 s per image
+Model file missing              -> restore last.pth from the USB / cloud backup

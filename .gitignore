@@ -1,0 +1,17 @@
+data/
+runs/
+qual_in/
+qual_foggy_in/
+qualitative/
+qualitative_foggy/
+fig/
+fig_in/
+fig_foggy_in/
+fig_clipart/
+fig_foggy/
+demo_test/
+viva_out*/
+results_*.txt
+*.pth
+__pycache__/
+.venv/
